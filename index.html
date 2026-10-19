@@ -74,6 +74,14 @@
           </div>
 
           <div class="stage-controls">
+            <div class="animation-mode-control">
+              <label for="animation-mode-select">抽獎動畫</label>
+              <select id="animation-mode-select" aria-describedby="animation-mode-hint">
+                <option value="standard">一般模式（2.5 秒）</option>
+                <option value="quick">快速模式（1 秒）</option>
+              </select>
+              <span id="animation-mode-hint">抽獎開始後會鎖定設定，變更僅套用於下一次抽獎。</span>
+            </div>
             <button id="btn-draw" class="btn-draw" disabled>開始抽獎</button>
           </div>
           <div id="draw-warning" class="draw-warning"></div>
@@ -99,6 +107,24 @@
       </section>
     </main>
   </div>
+
+  <dialog id="cancel-winner-dialog" class="cancel-winner-dialog">
+    <form id="cancel-winner-form">
+      <h2>取消這筆中獎結果</h2>
+      <p id="cancel-winner-summary" class="cancel-winner-summary"></p>
+      <label for="cancel-winner-reason">取消原因（選填）</label>
+      <textarea id="cancel-winner-reason" rows="3" maxlength="200" placeholder="例如：唱名三次未到場"></textarea>
+      <fieldset>
+        <legend>取消後是否允許此人再次參加抽獎？</legend>
+        <label><input type="radio" name="allow-reentry" value="false" checked> 不允許（維持不得重複中獎）</label>
+        <label><input type="radio" name="allow-reentry" value="true"> 允許（重新加入候選名單）</label>
+      </fieldset>
+      <div class="dialog-actions">
+        <button id="btn-cancel-winner-dismiss" class="btn-secondary" type="button">返回</button>
+        <button class="btn-danger" type="submit">確認取消並開放重抽</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="app.js"></script>
 </body>

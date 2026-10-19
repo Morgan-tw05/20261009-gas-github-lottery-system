@@ -15,7 +15,13 @@
   const STORAGE_KEYS = {
     API_URL: 'lottery_gas_api_url',
     WINNERS: 'lottery_winners_history',
-    DATA_CACHE: 'lottery_cached_data'
+    DATA_CACHE: 'lottery_cached_data',
+    ANIMATION_MODE: 'lottery_animation_mode'
+  };
+
+  const ANIMATION_DURATIONS = {
+    standard: 2500,
+    quick: 1000
   };
 
   // 內建展示示範資料（大學校園活動抽獎示範）
@@ -51,7 +57,9 @@
     prizes: [],
     participants: [],
     currentPrizeId: null,
+    animationMode: 'standard',
     winners: [], // 格式: [{ winnerId, name, department, prizeId, prizeName, timestamp }]
+    pendingCancellationId: null,
     isRolling: false,
     rollIntervalId: null
   };
@@ -93,6 +101,7 @@
       statDrawnCount: document.getElementById('stat-drawn-count'),
       statRemainingQuota: document.getElementById('stat-remaining-quota'),
       prizeDesc: document.getElementById('prize-desc'),
+      animationModeSelect: document.getElementById('animation-mode-select'),
 
       rollingDisplay: document.getElementById('rolling-display'),
       winnerCandidateName: domEl('.winner-candidate-name'),
@@ -103,7 +112,12 @@
 
       winnersListContainer: document.getElementById('winners-list-container'),
       btnExportCsv: document.getElementById('btn-export-csv'),
-      btnResetLottery: document.getElementById('btn-reset-lottery')
+      btnResetLottery: document.getElementById('btn-reset-lottery'),
+      cancelWinnerDialog: document.getElementById('cancel-winner-dialog'),
+      cancelWinnerForm: document.getElementById('cancel-winner-form'),
+      cancelWinnerSummary: document.getElementById('cancel-winner-summary'),
+      cancelWinnerReason: document.getElementById('cancel-winner-reason'),
+      btnCancelWinnerDismiss: document.getElementById('btn-cancel-winner-dismiss')
     };
   }
 
@@ -124,9 +138,13 @@
 
     dom.btnFetchData.addEventListener('click', handleFetchApiData);
     dom.prizeSelect.addEventListener('change', handlePrizeChange);
+    dom.animationModeSelect.addEventListener('change', handleAnimationModeChange);
     dom.btnDraw.addEventListener('click', handleStartDraw);
     dom.btnExportCsv.addEventListener('click', exportWinnersToCsv);
     dom.btnResetLottery.addEventListener('click', handleResetLottery);
+    dom.winnersListContainer.addEventListener('click', handleWinnerListClick);
+    dom.cancelWinnerForm.addEventListener('submit', handleCancelWinnerSubmit);
+    dom.btnCancelWinnerDismiss.addEventListener('click', () => dom.cancelWinnerDialog.close());
   }
 
   /**
@@ -140,9 +158,27 @@
         dom.gasApiUrl.value = savedUrl;
       }
 
+      const savedAnimationMode = localStorage.getItem(STORAGE_KEYS.ANIMATION_MODE);
+      if (Object.prototype.hasOwnProperty.call(ANIMATION_DURATIONS, savedAnimationMode)) {
+        state.animationMode = savedAnimationMode;
+      }
+      dom.animationModeSelect.value = state.animationMode;
+
       const savedWinners = localStorage.getItem(STORAGE_KEYS.WINNERS);
       if (savedWinners) {
         state.winners = JSON.parse(savedWinners);
+        let migrated = false;
+        state.winners.forEach(winner => {
+          if (!winner.recordId) {
+            winner.recordId = createRecordId();
+            migrated = true;
+          }
+          if (!winner.status) {
+            winner.status = 'active';
+            migrated = true;
+          }
+        });
+        if (migrated) persistWinners();
       }
 
       const cachedData = localStorage.getItem(STORAGE_KEYS.DATA_CACHE);
@@ -246,6 +282,26 @@
     updateStageAndStats();
   }
 
+  function handleAnimationModeChange(e) {
+    if (state.isRolling) {
+      e.target.value = state.animationMode;
+      return;
+    }
+
+    const selectedMode = e.target.value;
+    if (!Object.prototype.hasOwnProperty.call(ANIMATION_DURATIONS, selectedMode)) {
+      e.target.value = state.animationMode;
+      return;
+    }
+
+    state.animationMode = selectedMode;
+    try {
+      localStorage.setItem(STORAGE_KEYS.ANIMATION_MODE, selectedMode);
+    } catch (e) {
+      console.warn('儲存抽獎動畫模式失敗:', e);
+    }
+  }
+
   /**
    * 獲取當前所選獎品物件
    */
@@ -260,7 +316,7 @@
     const prize = state.prizes.find(p => p.id === prizeId);
     if (!prize) return { total: 0, drawn: 0, remaining: 0 };
 
-    const drawnCount = state.winners.filter(w => w.prizeId === prizeId).length;
+    const drawnCount = state.winners.filter(w => w.prizeId === prizeId && isActiveWinner(w)).length;
     const remaining = Math.max(0, prize.quota - drawnCount);
     return {
       total: prize.quota,
@@ -269,12 +325,26 @@
     };
   }
 
+  function isActiveWinner(winner) {
+    // 舊版儲存資料沒有 status 欄位，視為有效中獎以維持相容。
+    return winner.status !== 'cancelled';
+  }
+
+  function getPendingRedraw(prizeId) {
+    return state.winners.find(w => w.prizeId === prizeId && w.status === 'cancelled' && !w.redrawCompleted) || null;
+  }
+
   /**
    * 取得尚未中獎之合格抽獎人員池
    */
   function getEligibleParticipants() {
-    const wonUserIds = new Set(state.winners.map(w => w.winnerId));
-    return state.participants.filter(p => !wonUserIds.has(p.id));
+    const blockedUserIds = new Set();
+    state.winners.forEach(winner => {
+      if (isActiveWinner(winner) || winner.allowReentry !== true) {
+        blockedUserIds.add(winner.winnerId);
+      }
+    });
+    return state.participants.filter(p => !blockedUserIds.has(p.id));
   }
 
   /**
@@ -314,6 +384,7 @@
   function updateStageAndStats() {
     const currentPrize = getCurrentPrize();
     dom.drawWarning.textContent = '';
+    dom.animationModeSelect.disabled = state.isRolling;
 
     if (!currentPrize) {
       dom.statTotalQuota.textContent = '0';
@@ -331,6 +402,7 @@
     dom.prizeDesc.textContent = currentPrize.description || '';
 
     const eligible = getEligibleParticipants();
+    const pendingRedraw = getPendingRedraw(currentPrize.id);
 
     // 判斷按鈕是否可點擊
     if (state.isRolling) {
@@ -346,7 +418,10 @@
       dom.drawWarning.textContent = '⚠️ 所有人員皆已獲獎，名單已空。';
     } else {
       dom.btnDraw.disabled = false;
-      dom.btnDraw.textContent = '開始抽獎';
+      dom.btnDraw.textContent = pendingRedraw ? '重新抽選（補回取消名額）' : '開始抽獎';
+      if (pendingRedraw) {
+        dom.drawWarning.textContent = `此獎項有取消結果待補抽：${pendingRedraw.name}`;
+      }
     }
   }
 
@@ -374,7 +449,8 @@
     dom.rollingDisplay.classList.add('rolling');
     dom.stagePlaceholder.textContent = '正在抽取：' + currentPrize.name;
 
-    const duration = 2500; // 滾動動畫持續 2.5 秒
+    // 動畫時長在本次開始時固定；切換設定只會影響下一次抽獎。
+    const duration = ANIMATION_DURATIONS[state.animationMode];
     const startTime = Date.now();
     let speed = 50; // 毫秒切換頻率
 
@@ -422,7 +498,9 @@
     dom.winnerCandidateMeta.textContent = winnerMeta;
 
     // 記錄中獎者
+    const pendingRedraw = getPendingRedraw(prize.id);
     const winnerRecord = {
+      recordId: createRecordId(),
       winnerId: winner.id,
       name: winner.name,
       department: winner.department || '',
@@ -430,13 +508,65 @@
       email: winner.email || '',
       prizeId: prize.id,
       prizeName: prize.name,
-      timestamp: new Date().toLocaleString('zh-TW', { hour12: false })
+      timestamp: new Date().toLocaleString('zh-TW', { hour12: false }),
+      status: 'active',
+      isRedraw: Boolean(pendingRedraw),
+      replacesRecordId: pendingRedraw ? (pendingRedraw.redrawCompleted = true, pendingRedraw.recordId) : null
     };
 
     state.winners.push(winnerRecord);
     persistWinners();
 
     state.isRolling = false;
+    renderPrizeOptions();
+    updateStageAndStats();
+    renderWinnersList();
+  }
+
+  function createRecordId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function handleWinnerListClick(event) {
+    const exportButton = event.target.closest('[data-export-prize-id]');
+    if (exportButton) {
+      exportWinnersToCsv(exportButton.dataset.exportPrizeId);
+      return;
+    }
+
+    const button = event.target.closest('[data-cancel-record-id]');
+    if (!button) return;
+    const winner = state.winners.find(item => item.recordId === button.dataset.cancelRecordId);
+    if (!winner || !isActiveWinner(winner)) return;
+
+    state.pendingCancellationId = winner.recordId;
+    dom.cancelWinnerSummary.textContent = `${winner.prizeName}｜${winner.name}（${winner.timestamp}）`;
+    dom.cancelWinnerReason.value = '';
+    dom.cancelWinnerDialog.showModal();
+    dom.cancelWinnerReason.focus();
+  }
+
+  function handleCancelWinnerSubmit(event) {
+    event.preventDefault();
+    const winner = state.winners.find(item => item.recordId === state.pendingCancellationId);
+    const reason = dom.cancelWinnerReason.value.trim();
+    if (!winner || !isActiveWinner(winner)) return;
+
+    const allowReentry = dom.cancelWinnerForm.querySelector('input[name="allow-reentry"]:checked').value === 'true';
+    winner.status = 'cancelled';
+    winner.cancelledAt = new Date().toLocaleString('zh-TW', { hour12: false });
+    winner.cancelReason = reason;
+    winner.allowReentry = allowReentry;
+    winner.redrawCompleted = false;
+
+    state.currentPrizeId = winner.prizeId;
+    dom.prizeSelect.value = winner.prizeId;
+    state.pendingCancellationId = null;
+    dom.cancelWinnerDialog.close();
+    persistWinners();
     renderPrizeOptions();
     updateStageAndStats();
     renderWinnersList();
@@ -482,7 +612,18 @@
 
       const titleEl = document.createElement('div');
       titleEl.className = 'group-title';
-      titleEl.innerHTML = `<span>${group.prizeName}</span><span>(${group.items.length} 位)</span>`;
+      const activeCount = group.items.filter(isActiveWinner).length;
+      const groupName = document.createElement('span');
+      groupName.textContent = group.prizeName;
+      const groupCount = document.createElement('span');
+      groupCount.textContent = `有效 ${activeCount} 位 / 歷程 ${group.items.length} 筆`;
+      const exportButton = document.createElement('button');
+      exportButton.type = 'button';
+      exportButton.className = 'btn-sm btn-outline btn-export-prize';
+      exportButton.dataset.exportPrizeId = prizeId;
+      exportButton.textContent = '匯出此獎項 CSV';
+      exportButton.title = `匯出「${group.prizeName}」的有效中獎名單`;
+      titleEl.append(groupName, groupCount, exportButton);
       groupEl.appendChild(titleEl);
 
       const listEl = document.createElement('div');
@@ -490,15 +631,49 @@
 
       group.items.forEach(item => {
         const itemEl = document.createElement('div');
-        itemEl.className = 'winner-item';
+        const active = isActiveWinner(item);
+        itemEl.className = `winner-item${active ? '' : ' is-cancelled'}`;
         const metaParts = [item.department, item.grade, item.winnerId ? '#' + item.winnerId : ''].filter(Boolean).join(' · ');
-        itemEl.innerHTML = `
-          <div>
-            <div class="winner-item-name">${item.name}</div>
-            <div class="winner-item-meta">${metaParts}</div>
-          </div>
-          <div class="winner-item-time">${item.timestamp}</div>
-        `;
+        const detailsEl = document.createElement('div');
+        const nameEl = document.createElement('div');
+        nameEl.className = 'winner-item-name';
+        nameEl.textContent = item.name;
+        const statusEl = document.createElement('span');
+        statusEl.className = `winner-item-status${active ? '' : ' cancelled'}`;
+        statusEl.textContent = active ? (item.isRedraw ? '重新抽選中獎' : '有效') : '已取消';
+        nameEl.appendChild(statusEl);
+        const metaEl = document.createElement('div');
+        metaEl.className = 'winner-item-meta';
+        metaEl.textContent = metaParts;
+        detailsEl.append(nameEl, metaEl);
+        if (!active && item.cancelReason) {
+          const reasonEl = document.createElement('div');
+          reasonEl.className = 'winner-item-reason';
+          reasonEl.textContent = `取消原因：${item.cancelReason}`;
+          detailsEl.appendChild(reasonEl);
+        }
+
+        const actionsEl = document.createElement('div');
+        actionsEl.className = 'winner-item-actions';
+        const timeEl = document.createElement('div');
+        timeEl.className = 'winner-item-time';
+        timeEl.textContent = item.timestamp;
+        actionsEl.appendChild(timeEl);
+        if (active) {
+          const cancelButton = document.createElement('button');
+          cancelButton.type = 'button';
+          cancelButton.className = 'btn-cancel-winner';
+          cancelButton.dataset.cancelRecordId = item.recordId || '';
+          cancelButton.textContent = '取消並重抽';
+          cancelButton.disabled = !item.recordId;
+          actionsEl.appendChild(cancelButton);
+        } else if (item.cancelledAt) {
+          const cancelledAtEl = document.createElement('div');
+          cancelledAtEl.className = 'winner-item-time';
+          cancelledAtEl.textContent = `取消於 ${item.cancelledAt}`;
+          actionsEl.appendChild(cancelledAtEl);
+        }
+        itemEl.append(detailsEl, actionsEl);
         listEl.appendChild(itemEl);
       });
 
@@ -510,33 +685,44 @@
   /**
    * 匯出中獎名單為 CSV 檔案
    */
-  function exportWinnersToCsv() {
-    if (state.winners.length === 0) {
-      alert('目前尚無任何中獎紀錄可供匯出！');
+  function exportWinnersToCsv(prizeId = null) {
+    const activeWinners = state.winners.filter(winner =>
+      isActiveWinner(winner) && (prizeId === null || winner.prizeId === prizeId)
+    );
+    if (activeWinners.length === 0) {
+      alert(prizeId === null ? '目前尚無任何中獎紀錄可供匯出！' : '此獎項目前沒有有效的中獎紀錄可供匯出。');
       return;
     }
 
-    const headers = ['獎品名稱', '得獎學生姓名', '系所', '年級', '學號', '電子郵件', '中獎時間'];
-    const rows = state.winners.map(w => [
-      `"${(w.prizeName || '').replace(/"/g, '""')}"`,
-      `"${(w.name || '').replace(/"/g, '""')}"`,
-      `"${(w.department || '').replace(/"/g, '""')}"`,
-      `"${(w.grade || '').replace(/"/g, '""')}"`,
-      `"${(w.winnerId || '').replace(/"/g, '""')}"`,
-      `"${(w.email || '').replace(/"/g, '""')}"`,
-      `"${w.timestamp}"`
-    ]);
+    const headers = ['獎品名稱', '得獎學生姓名', '系所', '年級', '學號', '電子郵件', '中獎時間', '結果類型'];
+    const rows = activeWinners.map(w => [
+      w.prizeName || '',
+      w.name || '',
+      w.department || '',
+      w.grade || '',
+      w.winnerId || '',
+      w.email || '',
+      w.timestamp || '',
+      w.isRedraw ? '重新抽選' : '一般抽獎'
+    ].map(escapeCsvField));
 
     const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `中獎名冊_${new Date().toISOString().slice(0, 10)}.csv`);
+    const scope = prizeId === null
+      ? '全部獎項'
+      : (state.winners.find(winner => winner.prizeId === prizeId)?.prizeName || '指定獎項').replace(/[<>:"/\\|?*]/g, '_').trim();
+    link.setAttribute('download', `中獎名冊_${scope}_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+  }
+
+  function escapeCsvField(value) {
+    return `"${String(value).replace(/"/g, '""')}"`;
   }
 
   /**
